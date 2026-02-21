@@ -1,0 +1,13 @@
+# ============================================================
+#  requirements.txt
+#  Install with:
+#    pip install -r requirements.txt
+#
+#  NOTE: PyTorch with CUDA must be installed SEPARATELY first:
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# ============================================================
+
+openai-whisper>=20231117
+pyaudio>=0.2.13
+groq>=0.9.0
+numpy>=1.24.0

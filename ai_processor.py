@@ -1,5 +1,5 @@
 # ============================================================
-#  ai_processor.py  —  Groq AI analysis + question detection
+#  ai_processor.py  —  Interview AI with smart length + follow-up
 # ============================================================
 
 import re
@@ -8,116 +8,120 @@ import config
 from groq import Groq
 
 
-# Quick regex pre-filter to avoid unnecessary API calls
-_QUESTION_PATTERNS = [
-    r'\b(what do you think|your thoughts|would you say|can you explain|what about you)\b',
-    r'\b(do you|have you|are you|did you|will you|could you|can you)\b',
-    r'\b(what|why|how|when|where|who)\b.{3,60}\?',
-    r'\?',
-]
-
-
-def _quick_question_check(text: str) -> bool:
-    tl = text.lower()
-    # Direct name mention is always relevant
-    if config.YOUR_NAME.lower() in tl:
-        return True
-    for pat in _QUESTION_PATTERNS:
-        if re.search(pat, tl):
-            return True
-    return False
-
-
-# ----------------------------------------------------------
 class AIProcessor:
-    """
-    Sends transcribed text to Groq (Llama 3.1 8B) and returns
-    structured suggestions for the overlay.
-    """
 
     def __init__(self):
-        self.client       = Groq(api_key=config.GROQ_API_KEY)
-        self.history      = []          # Rolling transcript history
-        self.max_history  = 12          # Keep last ~60 seconds of context
-        self.meeting_ctx  = ""
+        self.client        = Groq(api_key=config.GROQ_API_KEY)
+        self.history       = []
+        self.max_history   = 12
+        self.meeting_ctx   = ""
+        self.last_question = ""
+        self.last_answer   = ""
         print("[AIProcessor] ✓ Groq client ready.")
 
-    # ----------------------------------------------------------
     def set_meeting_context(self, context: str):
-        """
-        Call this before the meeting with agenda, your role, key points.
-        The richer this is, the better the suggestions.
-        """
         self.meeting_ctx = context.strip()
         print("[AIProcessor] Meeting context set.")
 
-    # ----------------------------------------------------------
+    def _build_prompt(self, text: str, recent: str, manual: bool = False) -> str:
+        return f"""You are a private real-time interview assistant for {config.YOUR_NAME}.
+
+CANDIDATE PROFILE (use ONLY for HR/behavioral/research questions):
+{self.meeting_ctx if self.meeting_ctx else "No context provided."}
+
+RECENT CONVERSATION:
+{recent}
+
+LAST QUESTION ANSWERED: {self.last_question if self.last_question else "None"}
+LAST ANSWER GIVEN: {self.last_answer[:100] if self.last_answer else "None"}
+
+LATEST TEXT:
+{text}
+
+STEP 1 — Detect question type:
+A) NEW question → answer it fresh
+B) FOLLOW-UP → interviewer wants more detail on last question ("elaborate", "tell me more", "can you expand", "give example")
+C) NOT A QUESTION → return {{"is_question": false}}
+
+STEP 2 — Classify:
+- "hr": about himself, introduce yourself, strengths, weaknesses → USE profile
+- "behavioral": past situations, STAR format → USE profile
+- "technical_ml": ML, DL concepts → general knowledge only
+- "technical_dsa": DSA, algorithms → general knowledge only
+- "technical_quant": probability, stats, HFT → general knowledge only
+- "research": forest fire, MODIS, XGBoost → USE profile
+- "general": other topics
+
+STEP 3 — Determine answer length:
+- "short": yes/no, simple fact, one concept → 1-2 sentences
+- "medium": explain concept, describe experience → 3-4 sentences
+- "long": system design, detailed project, STAR format → 5-6 sentences
+
+STEP 4 — Respond with JSON:
+{{
+  "is_question": true,
+  "is_followup": true/false,
+  "question_type": one of above,
+  "answer_length": "short"/"medium"/"long",
+  "question": exact question or follow-up request,
+  "hint": key insight in 1 sentence,
+  "answer": natural spoken answer matching the length above. For technical use general knowledge. For HR/behavioral use real profile.,
+  "confidence_tip": one short delivery tip
+}}
+
+Reply ONLY with valid JSON."""
+
     def process(self, transcript: str) -> dict | None:
-        """
-        Returns a dict with keys:
-          is_question  : bool
-          question     : str | None
-          key_point    : str | None
-          suggestion   : str | None
-          urgency      : "high" | "medium" | "low"
-        Returns None if the text is not worth showing.
-        """
         self.history.append(transcript)
         if len(self.history) > self.max_history:
             self.history.pop(0)
 
-        # Skip API call if clearly not a question and history is short
-        if len(self.history) > 2 and not _quick_question_check(transcript):
-            return None
-
         recent = " ".join(self.history[-8:])
-
-        prompt = f"""You are a silent, private meeting assistant helping {config.YOUR_NAME} during a live video call.
-
-MEETING CONTEXT:
-{self.meeting_ctx if self.meeting_ctx else "No context provided."}
-
-RECENT CONVERSATION (last ~40 seconds):
-{recent}
-
-LATEST SEGMENT JUST SPOKEN:
-{transcript}
-
-Your job: analyse the latest segment and respond ONLY with a single valid JSON object.
-Fields:
-  "is_question": true if someone asked a question (to {config.YOUR_NAME} or the group), else false
-  "question": the EXACT question asked, copied or closely paraphrased from the transcript, or null
-  "answer": a direct, confident, conversational answer that {config.YOUR_NAME} can say out loud immediately (2-4 sentences). Start directly with the answer, no filler like "Great question". Use the meeting context to make it specific and accurate. null if no question.
-  "key_point": the single most important fact/decision just mentioned (max 10 words), or null if a question was asked
-  "urgency": "high" if directly asked to {config.YOUR_NAME}, "medium" if relevant topic, "low" otherwise
-
-Rules:
-- answer must sound natural and spoken, not written
-- Be specific — use names, numbers, facts from the meeting context
-- If nothing important happened, set answer and key_point to null
-- Reply ONLY with the JSON, no other text"""
 
         try:
             response = self.client.chat.completions.create(
-                model       = "llama-3.1-8b-instant",
-                messages    = [{"role": "user", "content": prompt}],
-                max_tokens  = 320,
+                model = "llama-3.1-8b-instant",
+                messages    = [{"role": "user", "content": self._build_prompt(transcript, recent)}],
+                max_tokens  = 500,
                 temperature = 0.2,
             )
-            raw = response.choices[0].message.content.strip()
-
-            # Strip markdown fences if model adds them
-            raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
+            raw  = response.choices[0].message.content.strip()
+            raw  = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
             data = json.loads(raw)
 
-            # Only return if there's something useful to show
-            if data.get("answer") or data.get("key_point") or data.get("is_question"):
-                return data
-            return None
+            if not data.get("is_question") or not data.get("answer"):
+                return None
+
+            # Avoid duplicate questions
+            q = data.get("question", "").strip()
+            self.last_question = q
+            self.last_answer = data.get("answer", "")
+            return data
 
         except json.JSONDecodeError:
-            print(f"[AIProcessor] JSON parse error on: {raw[:80]}")
+            print(f"[AIProcessor] JSON parse error: {raw[:80]}")
             return None
         except Exception as e:
             print(f"[AIProcessor] API error: {e}")
+            return None
+
+    def ask(self, question: str) -> dict | None:
+        recent = " ".join(self.history[-8:]) if self.history else "No conversation yet."
+        try:
+            response = self.client.chat.completions.create(
+                model = "llama-3.1-8b-instant",
+                messages    = [{"role": "user", "content": self._build_prompt(question, recent, manual=True)}],
+                max_tokens  = 500,
+                temperature = 0.3,
+            )
+            raw  = response.choices[0].message.content.strip()
+            raw  = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
+            data = json.loads(raw)
+            if not data.get("answer"):
+                data["answer"]      = "Could not generate answer. Try rephrasing."
+                data["is_question"] = True
+                data["question"]    = question
+            return data
+        except Exception as e:
+            print(f"[AIProcessor] Manual ask error: {e}")
             return None
